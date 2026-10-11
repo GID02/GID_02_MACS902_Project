@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import socket
 import ssl
@@ -74,6 +75,8 @@ def recv_message(conn: ssl.SSLSocket) -> dict:
 def send_file(file_path: Path) -> None:
     """Connect to the server over mTLS and send one file."""
     data = file_path.read_bytes()
+    file_hash = hashlib.sha256(data).hexdigest()
+    print(f"[*] SHA-256: {file_hash}")
     context = create_tls_context()
 
     with socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=10) as sock:
@@ -85,7 +88,7 @@ def send_file(file_path: Path) -> None:
             print(f"    Protocol: {conn.version()} | Cipher: {conn.cipher()[0]}")
 
             # 1) Send file metadata
-            send_message(conn, {"filename": file_path.name, "size": len(data)})
+            send_message(conn, {"filename": file_path.name, "size": len(data), "sha256": file_hash})
 
             # 2) Send file content
             conn.sendall(data)

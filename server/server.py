@@ -6,6 +6,8 @@ Receives files from authenticated clients over TLS 1.3
 with mutual authentication (mTLS).
 """
 
+import hashlib
+import hmac
 import json
 import socket
 import ssl
@@ -85,6 +87,19 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple) -> None:
 
     # 2) Receive file content
     data = recv_exact(conn, size)
+
+    # 2b) Integrity check: recompute SHA-256 and compare with the sender's hash
+    received_hash = hashlib.sha256(data).hexdigest()
+    expected_hash = header.get("sha256", "")
+    print(f"    Expected SHA-256: {expected_hash}")
+    print(f"    Received SHA-256: {received_hash}")
+
+    if not hmac.compare_digest(received_hash, expected_hash):
+        print(f"[!] INTEGRITY CHECK FAILED - '{filename}' rejected (file was modified)")
+        send_message(conn, {"status": "REJECTED", "message": "Integrity check failed"})
+        return
+
+    print("[+] Integrity verified (SHA-256 match)")
 
     # 3) Save the file
     RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
