@@ -8,13 +8,18 @@ Usage:
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import socket
 import ssl
 import struct
 import sys
+import time
 from pathlib import Path
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 # ---------- Configuration ----------
 SERVER_HOST = "localhost"
@@ -72,6 +77,14 @@ def recv_message(conn: ssl.SSLSocket) -> dict:
     return json.loads(recv_exact(conn, length).decode("utf-8"))
 
 
+def sign_manifest(manifest: dict) -> str:
+    """Sign the file manifest with the client's private key (ECDSA P-256 + SHA-256)."""
+    private_key = serialization.load_pem_private_key(CLIENT_KEY.read_bytes(), password=None)
+    manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    signature = private_key.sign(manifest_bytes, ec.ECDSA(hashes.SHA256()))
+    return base64.b64encode(signature).decode("ascii")
+
+
 def send_file(file_path: Path) -> None:
     """Connect to the server over mTLS and send one file."""
     data = file_path.read_bytes()
@@ -87,8 +100,16 @@ def send_file(file_path: Path) -> None:
             print(f"[+] Connected to server: {subject.get('commonName')} (certificate verified)")
             print(f"    Protocol: {conn.version()} | Cipher: {conn.cipher()[0]}")
 
-            # 1) Send file metadata
-            send_message(conn, {"filename": file_path.name, "size": len(data), "sha256": file_hash})
+            # 1) Build and sign the manifest (non-repudiation), then send it
+            manifest = {
+                "filename": file_path.name,
+                "size": len(data),
+                "sha256": file_hash,
+                "timestamp": int(time.time()),
+            }
+            signature = sign_manifest(manifest)
+            print("[*] Manifest signed with client private key (ECDSA P-256)")
+            send_message(conn, {"manifest": manifest, "signature": signature})
 
             # 2) Send file content
             conn.sendall(data)

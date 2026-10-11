@@ -6,17 +6,26 @@ Receives files from authenticated clients over TLS 1.3
 with mutual authentication (mTLS).
 """
 
+import base64
 import hashlib
 import hmac
 import json
 import socket
 import ssl
 import struct
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
 
 # ---------- Configuration ----------
 HOST = "127.0.0.1"
 PORT = 8443
+MAX_CLOCK_SKEW = 300  # seconds: reject manifests older/newer than 5 minutes (replay protection)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CERTS_DIR = BASE_DIR / "certs"
@@ -70,6 +79,15 @@ def recv_message(conn: ssl.SSLSocket) -> dict:
     return json.loads(recv_exact(conn, length).decode("utf-8"))
 
 
+def verify_signature(conn: ssl.SSLSocket, manifest: dict, signature_b64: str) -> x509.Certificate:
+    """Verify the manifest signature using the public key in the client's TLS certificate."""
+    cert = x509.load_der_x509_certificate(conn.getpeercert(binary_form=True))
+    manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    signature = base64.b64decode(signature_b64)
+    cert.public_key().verify(signature, manifest_bytes, ec.ECDSA(hashes.SHA256()))
+    return cert
+
+
 def handle_client(conn: ssl.SSLSocket, addr: tuple) -> None:
     """Receive one file from an authenticated client."""
     # The client's identity comes from its CA-signed certificate
@@ -80,17 +98,19 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple) -> None:
     print(f"[+] Client authenticated: {client_name} ({addr[0]}:{addr[1]})")
     print(f"    Protocol: {conn.version()} | Cipher: {conn.cipher()[0]}")
 
-    # 1) Receive file metadata
+    # 1) Receive the signed manifest
     header = recv_message(conn)
-    filename = Path(header["filename"]).name  # strip any path (prevents path traversal)
-    size = int(header["size"])
+    manifest = header["manifest"]
+    signature_b64 = header["signature"]
+    filename = Path(manifest["filename"]).name  # strip any path (prevents path traversal)
+    size = int(manifest["size"])
 
     # 2) Receive file content
     data = recv_exact(conn, size)
 
     # 2b) Integrity check: recompute SHA-256 and compare with the sender's hash
     received_hash = hashlib.sha256(data).hexdigest()
-    expected_hash = header.get("sha256", "")
+    expected_hash = manifest.get("sha256", "")
     print(f"    Expected SHA-256: {expected_hash}")
     print(f"    Received SHA-256: {received_hash}")
 
@@ -101,10 +121,36 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple) -> None:
 
     print("[+] Integrity verified (SHA-256 match)")
 
+    # 2c) Non-repudiation: verify the sender's digital signature
+    try:
+        sender_cert = verify_signature(conn, manifest, signature_b64)
+    except (InvalidSignature, ValueError):
+        print(f"[!] SIGNATURE INVALID - '{filename}' rejected (cannot prove who sent it)")
+        send_message(conn, {"status": "REJECTED", "message": "Invalid digital signature"})
+        return
+    print("[+] Digital signature valid (ECDSA P-256) - sender cannot deny sending this file")
+
+    # 2d) Freshness check: reject old or replayed manifests
+    if abs(time.time() - manifest["timestamp"]) > MAX_CLOCK_SKEW:
+        print(f"[!] STALE MANIFEST - '{filename}' rejected (possible replay attack)")
+        send_message(conn, {"status": "REJECTED", "message": "Manifest timestamp out of range"})
+        return
+
     # 3) Save the file
     RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
     (RECEIVED_DIR / filename).write_bytes(data)
     print(f"[+] Received '{filename}' ({size} bytes) from {client_name}")
+
+    # 3b) Save a signed receipt as non-repudiation evidence
+    receipt = {
+        "sender": client_name,
+        "sender_cert_serial": format(sender_cert.serial_number, "X"),
+        "manifest": manifest,
+        "signature": signature_b64,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (RECEIVED_DIR / f"{filename}.receipt.json").write_text(json.dumps(receipt, indent=2))
+    print(f"[+] Signed receipt saved: {filename}.receipt.json")
 
     # 4) Confirm to the client
     send_message(conn, {"status": "OK", "message": f"'{filename}' received"})
