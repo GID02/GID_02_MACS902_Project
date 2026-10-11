@@ -1,0 +1,4 @@
+certs/*.key
+__pycache__/
+.venv/
+.DS_Store
