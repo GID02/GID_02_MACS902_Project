@@ -1,0 +1,3 @@
+Patient: Alyazia Mohammed - Diagnosis: Confidential - Blood Type: O+
+Patient: Nabtah Hamdan - Diagnosis: Confidential - Blood Type: A+
+Patient: Mariam Ahmed - Diagnosis: Confidential - Blood Type: B-
