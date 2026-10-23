@@ -13,6 +13,7 @@ import json
 import socket
 import ssl
 import struct
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,10 @@ from cryptography.hazmat.primitives.asymmetric import ec
 HOST = "127.0.0.1"
 PORT = 8443
 MAX_CLOCK_SKEW = 300  # seconds: reject manifests older/newer than 5 minutes (replay protection)
+SOCKET_TIMEOUT = 10                 # seconds: drop clients that stop sending (Slowloris protection)
+MAX_FILE_SIZE = 100 * 1024 * 1024   # 100 MB: reject oversized files (disk exhaustion protection)
+MAX_HEADER_SIZE = 64 * 1024         # 64 KB: reject oversized manifests (memory exhaustion protection)
+MAX_CONNECTIONS = 10                # concurrent clients (DoS protection)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CERTS_DIR = BASE_DIR / "certs"
@@ -76,6 +81,8 @@ def send_message(conn: ssl.SSLSocket, message: dict) -> None:
 def recv_message(conn: ssl.SSLSocket) -> dict:
     """Receive a length-prefixed JSON message."""
     length = struct.unpack("!I", recv_exact(conn, 4))[0]
+    if length > MAX_HEADER_SIZE:
+        raise ValueError(f"Header too large ({length} bytes)")
     return json.loads(recv_exact(conn, length).decode("utf-8"))
 
 
@@ -104,6 +111,12 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple) -> None:
     signature_b64 = header["signature"]
     filename = Path(manifest["filename"]).name  # strip any path (prevents path traversal)
     size = int(manifest["size"])
+
+    # Availability: reject oversized or invalid sizes BEFORE reading any file data
+    if size < 0 or size > MAX_FILE_SIZE:
+        print(f"[!] FILE TOO LARGE - '{filename}' ({size} bytes) rejected (limit {MAX_FILE_SIZE} bytes)")
+        send_message(conn, {"status": "REJECTED", "message": "File size exceeds limit"})
+        return
 
     # 2) Receive file content
     data = recv_exact(conn, size)
@@ -156,6 +169,26 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple) -> None:
     send_message(conn, {"status": "OK", "message": f"'{filename}' received"})
 
 
+connection_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+
+def serve_client(client_sock: socket.socket, addr: tuple, context: ssl.SSLContext) -> None:
+    """Handle one client in its own thread: TLS handshake, transfer, cleanup."""
+    try:
+        client_sock.settimeout(SOCKET_TIMEOUT)
+        with context.wrap_socket(client_sock, server_side=True) as conn:
+            handle_client(conn, addr)
+    except (socket.timeout, TimeoutError):
+        print(f"[!] TIMEOUT - {addr[0]}:{addr[1]} sent nothing for {SOCKET_TIMEOUT}s, connection dropped")
+    except ssl.SSLError as e:
+        print(f"[!] TLS handshake rejected from {addr[0]}: {e.reason}")
+    except Exception as e:
+        print(f"[!] Error with {addr[0]}: {e}")
+    finally:
+        client_sock.close()
+        connection_slots.release()
+
+
 def main() -> None:
     context = create_tls_context()
 
@@ -167,14 +200,11 @@ def main() -> None:
 
         while True:
             client_sock, addr = sock.accept()
-            try:
-                # TLS handshake happens here; invalid clients are rejected
-                with context.wrap_socket(client_sock, server_side=True) as conn:
-                    handle_client(conn, addr)
-            except ssl.SSLError as e:
-                print(f"[!] TLS handshake rejected from {addr[0]}: {e.reason}")
-            except Exception as e:
-                print(f"[!] Error with {addr[0]}: {e}")
+            if not connection_slots.acquire(blocking=False):
+                print(f"[!] BUSY - max {MAX_CONNECTIONS} clients reached, rejecting {addr[0]}:{addr[1]}")
+                client_sock.close()
+                continue
+            threading.Thread(target=serve_client, args=(client_sock, addr, context), daemon=True).start()
 
 
 if __name__ == "__main__":
