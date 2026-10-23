@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 # ---------- Configuration ----------
 SERVER_HOST = "localhost"
 SERVER_PORT = 8443
+INSECURE_PORT = 8080  # plaintext port for the Wireshark comparison demo ONLY
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CERTS_DIR = BASE_DIR / "certs"
@@ -33,7 +34,7 @@ CLIENT_CERT = CERTS_DIR / "client.crt"
 CLIENT_KEY = CERTS_DIR / "client.key"
 
 
-def create_tls_context() -> ssl.SSLContext:
+def create_tls_context(keylog: str | None = None) -> ssl.SSLContext:
     """Build a hardened TLS 1.3 client context that verifies the server and presents a client certificate."""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
@@ -50,6 +51,10 @@ def create_tls_context() -> ssl.SSLContext:
     # These are already the defaults for PROTOCOL_TLS_CLIENT; set explicitly for clarity
     context.verify_mode = ssl.CERT_REQUIRED
     context.check_hostname = True
+
+    # DEMO ONLY: export TLS session secrets so Wireshark can decrypt the capture
+    if keylog:
+        context.keylog_filename = keylog
 
     return context
 
@@ -85,12 +90,43 @@ def sign_manifest(manifest: dict) -> str:
     return base64.b64encode(signature).decode("ascii")
 
 
-def send_file(file_path: Path) -> None:
-    """Connect to the server over mTLS and send one file."""
+def transfer(conn, file_path: Path, data: bytes, file_hash: str) -> None:
+    """Send the signed manifest and the file content over an established connection."""
+    # 1) Build and sign the manifest (non-repudiation), then send it
+    manifest = {
+        "filename": file_path.name,
+        "size": len(data),
+        "sha256": file_hash,
+        "timestamp": int(time.time()),
+    }
+    signature = sign_manifest(manifest)
+    print("[*] Manifest signed with client private key (ECDSA P-256)")
+    send_message(conn, {"manifest": manifest, "signature": signature})
+
+    # 2) Send file content
+    conn.sendall(data)
+    print(f"[+] Sent '{file_path.name}' ({len(data)} bytes)")
+
+    # 3) Wait for the server's confirmation
+    response = recv_message(conn)
+    print(f"[+] Server response: {response['status']} - {response['message']}")
+
+
+def send_file(file_path: Path, insecure: bool = False, keylog: str | None = None) -> None:
+    """Connect to the server and send one file (mTLS by default; plaintext only for the demo)."""
     data = file_path.read_bytes()
     file_hash = hashlib.sha256(data).hexdigest()
     print(f"[*] SHA-256: {file_hash}")
-    context = create_tls_context()
+
+    if insecure:
+        print(f"[!] WARNING: INSECURE DEMO MODE - sending in PLAINTEXT to port {INSECURE_PORT}")
+        with socket.create_connection((SERVER_HOST, INSECURE_PORT), timeout=10) as conn:
+            transfer(conn, file_path, data, file_hash)
+        return
+
+    context = create_tls_context(keylog)
+    if keylog:
+        print(f"[!] TLS session keys will be written to '{keylog}' (Wireshark decryption demo only)")
 
     with socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=10) as sock:
         # TLS handshake: verify server certificate + hostname, present client certificate
@@ -99,25 +135,7 @@ def send_file(file_path: Path) -> None:
             subject = dict(item[0] for item in cert["subject"])
             print(f"[+] Connected to server: {subject.get('commonName')} (certificate verified)")
             print(f"    Protocol: {conn.version()} | Cipher: {conn.cipher()[0]}")
-
-            # 1) Build and sign the manifest (non-repudiation), then send it
-            manifest = {
-                "filename": file_path.name,
-                "size": len(data),
-                "sha256": file_hash,
-                "timestamp": int(time.time()),
-            }
-            signature = sign_manifest(manifest)
-            print("[*] Manifest signed with client private key (ECDSA P-256)")
-            send_message(conn, {"manifest": manifest, "signature": signature})
-
-            # 2) Send file content
-            conn.sendall(data)
-            print(f"[+] Sent '{file_path.name}' ({len(data)} bytes)")
-
-            # 3) Wait for the server's confirmation
-            response = recv_message(conn)
-            print(f"[+] Server response: {response['status']} - {response['message']}")
+            transfer(conn, file_path, data, file_hash)
 
 
 def main() -> None:
@@ -126,6 +144,10 @@ def main() -> None:
 
     send_parser = subparsers.add_parser("send", help="Send a file to the server")
     send_parser.add_argument("file", type=Path, help="Path of the file to send")
+    send_parser.add_argument("--insecure", action="store_true",
+                             help="DEMO ONLY: send in plaintext (no TLS) for the Wireshark comparison")
+    send_parser.add_argument("--keylog", metavar="FILE",
+                             help="DEMO ONLY: write TLS session keys to FILE so Wireshark can decrypt")
 
     args = parser.parse_args()
 
@@ -134,7 +156,7 @@ def main() -> None:
             print(f"[!] File not found: {args.file}")
             sys.exit(1)
         try:
-            send_file(args.file)
+            send_file(args.file, insecure=args.insecure, keylog=args.keylog)
         except ssl.SSLCertVerificationError as e:
             print(f"[!] Server certificate verification failed: {e.verify_message}")
             sys.exit(1)

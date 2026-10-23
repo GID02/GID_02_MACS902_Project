@@ -6,6 +6,7 @@ Receives files from authenticated clients over TLS 1.3
 with mutual authentication (mTLS).
 """
 
+import argparse
 import base64
 import hashlib
 import hmac
@@ -26,6 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 # ---------- Configuration ----------
 HOST = "127.0.0.1"
 PORT = 8443
+INSECURE_PORT = 8080  # plaintext port for the Wireshark comparison demo ONLY
 MAX_CLOCK_SKEW = 300  # seconds: reject manifests older/newer than 5 minutes (replay protection)
 SOCKET_TIMEOUT = 10                 # seconds: drop clients that stop sending (Slowloris protection)
 MAX_FILE_SIZE = 100 * 1024 * 1024   # 100 MB: reject oversized files (disk exhaustion protection)
@@ -169,15 +171,35 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple) -> None:
     send_message(conn, {"status": "OK", "message": f"'{filename}' received"})
 
 
+def handle_insecure_client(conn: socket.socket, addr: tuple) -> None:
+    """DEMO ONLY: receive a file over plain TCP (no TLS) to show what an attacker sees."""
+    print(f"[!] INSECURE connection from {addr[0]}:{addr[1]} - NO encryption, NO authentication")
+    header = recv_message(conn)
+    manifest = header["manifest"]
+    filename = "INSECURE_" + Path(manifest["filename"]).name
+    size = int(manifest["size"])
+    if size < 0 or size > MAX_FILE_SIZE:
+        send_message(conn, {"status": "REJECTED", "message": "File size exceeds limit"})
+        return
+    data = recv_exact(conn, size)
+    RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
+    (RECEIVED_DIR / filename).write_bytes(data)
+    print(f"[!] Received '{filename}' ({size} bytes) in PLAINTEXT")
+    send_message(conn, {"status": "OK", "message": f"'{filename}' received (insecure)"})
+
+
 connection_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
 
-def serve_client(client_sock: socket.socket, addr: tuple, context: ssl.SSLContext) -> None:
+def serve_client(client_sock: socket.socket, addr: tuple, context: ssl.SSLContext | None) -> None:
     """Handle one client in its own thread: TLS handshake, transfer, cleanup."""
     try:
         client_sock.settimeout(SOCKET_TIMEOUT)
-        with context.wrap_socket(client_sock, server_side=True) as conn:
-            handle_client(conn, addr)
+        if context is None:
+            handle_insecure_client(client_sock, addr)
+        else:
+            with context.wrap_socket(client_sock, server_side=True) as conn:
+                handle_client(conn, addr)
     except (socket.timeout, TimeoutError):
         print(f"[!] TIMEOUT - {addr[0]}:{addr[1]} sent nothing for {SOCKET_TIMEOUT}s, connection dropped")
     except ssl.SSLError as e:
@@ -190,13 +212,24 @@ def serve_client(client_sock: socket.socket, addr: tuple, context: ssl.SSLContex
 
 
 def main() -> None:
-    context = create_tls_context()
+    parser = argparse.ArgumentParser(description="Secure File Transfer server (TLS 1.3 + mTLS)")
+    parser.add_argument("--insecure", action="store_true",
+                        help="DEMO ONLY: run a plaintext server (no TLS) for the Wireshark comparison")
+    args = parser.parse_args()
+
+    if args.insecure:
+        context, port = None, INSECURE_PORT
+    else:
+        context, port = create_tls_context(), PORT
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((HOST, PORT))
+        sock.bind((HOST, port))
         sock.listen(5)
-        print(f"[*] Server listening on {HOST}:{PORT} (TLS 1.3 + mutual authentication)")
+        if args.insecure:
+            print(f"[!] WARNING: INSECURE DEMO SERVER on {HOST}:{port} - plaintext, no TLS, no authentication")
+        else:
+            print(f"[*] Server listening on {HOST}:{port} (TLS 1.3 + mutual authentication)")
 
         while True:
             client_sock, addr = sock.accept()
